@@ -1,0 +1,118 @@
+rules_version = '2';
+
+// CIT Palm Attendance — Firestore security rules.
+// Access control is enforced HERE (server-side), not just in the UI (§3, §14 of the brief).
+// Roles/sections come from Firebase Auth custom claims set by scripts/set-claims.mjs or scripts/seed.mjs:
+//   { role: 'advisor' | 'coordinator' | 'hod', section: 'A'..'Q' (advisors only) }
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function role() {
+      return signedIn() ? request.auth.token.get('role', '') : '';
+    }
+    function mySection() {
+      return signedIn() ? request.auth.token.get('section', '') : '';
+    }
+    // Coordinator and HOD have identical full-read access across all 17 sections.
+    function isStaff() {
+      return role() == 'coordinator' || role() == 'hod';
+    }
+    // Advisors are hard-isolated to their own section.
+    function ownsSection(sectionId) {
+      return role() == 'advisor' && mySection() == sectionId && sectionId != '';
+    }
+    function validStatus(s) {
+      return s in ['present', 'absent', 'od', 'others'];
+    }
+    // 'others' MUST carry a non-empty reason (§6, §14).
+    function reasonOk(data) {
+      return data.status != 'others'
+        || (data.get('reason', '') is string && data.get('reason', '').size() > 0);
+    }
+
+    // ── users: profile docs. Managed by admin scripts only. ──
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isStaff());
+      allow write: if false;
+    }
+
+    // ── sections A–Q: managed by admin scripts only. ──
+    match /sections/{sectionId} {
+      allow read: if isStaff() || ownsSection(sectionId);
+      allow write: if false;
+    }
+
+    // ── students: advisor of the section manages; staff read everything. ──
+    match /students/{studentId} {
+      allow read: if isStaff() || ownsSection(resource.data.sectionId);
+      allow create: if ownsSection(request.resource.data.sectionId);
+      allow update: if ownsSection(resource.data.sectionId)
+        && request.resource.data.sectionId == resource.data.sectionId;
+      allow delete: if false;
+    }
+
+    // ── embeddings: biometric templates. ONLY the owning section's advisor —
+    //    coordinators/HOD do NOT need raw embeddings and are denied (privacy, §11). ──
+    match /embeddings/{studentId} {
+      allow read: if ownsSection(resource.data.sectionId);
+      allow create: if ownsSection(request.resource.data.sectionId)
+        && request.resource.data.embedding is list
+        && request.resource.data.embedding.size() == 256;
+      allow update: if ownsSection(resource.data.sectionId)
+        && request.resource.data.sectionId == resource.data.sectionId
+        && request.resource.data.embedding is list
+        && request.resource.data.embedding.size() == 256;
+      allow delete: if ownsSection(resource.data.sectionId);
+    }
+
+    // ── attendanceRecords: one doc per student per day, id = "<date>_<studentId>"
+    //    (id scheme makes duplicate day-records impossible; update = same-day correction). ──
+    match /attendanceRecords/{recordId} {
+      allow read: if isStaff() || ownsSection(resource.data.sectionId);
+      allow create: if ownsSection(request.resource.data.sectionId)
+        && recordId == request.resource.data.date + '_' + request.resource.data.studentId
+        && validStatus(request.resource.data.status)
+        && reasonOk(request.resource.data)
+        && request.resource.data.markedBy == request.auth.uid;
+      allow update: if ownsSection(resource.data.sectionId)
+        && request.resource.data.date == resource.data.date
+        && request.resource.data.studentId == resource.data.studentId
+        && request.resource.data.sectionId == resource.data.sectionId
+        && validStatus(request.resource.data.status)
+        && reasonOk(request.resource.data);
+      allow delete: if false;
+    }
+
+    // ── academicCalendar: doc id = 'YYYY-MM-DD'. Everyone signed-in reads;
+    //    coordinator/HOD maintain it. Drives working-day counting (§7). ──
+    match /academicCalendar/{date} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+
+    // ── attendanceSummary: derived running % per student. ──
+    match /attendanceSummary/{studentId} {
+      allow read: if isStaff() || ownsSection(resource.data.sectionId);
+      allow create: if ownsSection(request.resource.data.sectionId);
+      allow update: if ownsSection(resource.data.sectionId)
+        && request.resource.data.sectionId == resource.data.sectionId;
+      allow delete: if false;
+    }
+
+    // ── verificationEvents: append-only instrumentation log (similarity, outcome,
+    //    quality, liveness) for later FAR/FRR analysis (§8, §10). ──
+    match /verificationEvents/{eventId} {
+      allow read: if isStaff() || ownsSection(resource.data.sectionId);
+      allow create: if ownsSection(request.resource.data.sectionId);
+      allow update, delete: if false;
+    }
+
+    // Default deny.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

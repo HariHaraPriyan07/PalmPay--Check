@@ -1,0 +1,27 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# misc
+.DS_Store
+*.pem
+.vscode/
+
+# env & secrets — never commit
+.env
+.env.local
+.env*.local
+serviceAccountKey.json
+
+# firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# ts
+*.tsbuildinfo
