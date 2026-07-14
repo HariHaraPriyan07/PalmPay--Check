@@ -1,0 +1,153 @@
+/* Theme v2 "Aurora Biometric" — tokens mirror tailwind.config.ts.
+   design-system/MASTER.md remains the source of truth for semantics. */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-primary: #22d3ee;
+  --color-on-primary: #04121a;
+  --color-secondary: #818cf8;
+  --color-accent: #a78bfa;
+  --color-background: #05080f;
+  --color-surface: #0b1220;
+  --color-foreground: #f1f5f9;
+  --color-body: #b6c2d9;
+  --color-muted: #16203a;
+  --color-muted-fg: #7c8db0;
+  --color-border: #1e2a45;
+  --color-border-neutral: #233052;
+  --color-destructive: #f87171;
+  --color-ring: #22d3ee;
+
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2rem;
+  --space-2xl: 3rem;
+  --space-3xl: 4rem;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-body);
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+/* Fixed aurora backdrop: two soft radial glows + a faint perspective grid.
+   Sits behind everything; pure CSS so it costs nothing on low-end machines. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(ellipse 60% 45% at 18% -5%, rgba(34, 211, 238, 0.13), transparent 60%),
+    radial-gradient(ellipse 55% 45% at 85% 0%, rgba(167, 139, 250, 0.12), transparent 60%),
+    radial-gradient(ellipse 70% 55% at 50% 115%, rgba(56, 130, 246, 0.10), transparent 62%);
+  pointer-events: none;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.045) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 100%);
+  pointer-events: none;
+}
+
+h1, h2, h3, h4 {
+  font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  color: var(--color-foreground);
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.3);
+  color: #f1f5f9;
+}
+
+/* Slim dark scrollbars to match the HUD look */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #233052 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #233052;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  /* Frosted glass panel — the base card surface of the whole app */
+  .glass-panel {
+    background: linear-gradient(160deg, rgba(17, 26, 46, 0.82), rgba(11, 18, 32, 0.72));
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+
+  .glass-panel-bright {
+    background: linear-gradient(160deg, rgba(24, 36, 62, 0.9), rgba(13, 21, 38, 0.8));
+    border: 1px solid rgba(34, 211, 238, 0.22);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+
+  /* Aurora gradient headline text */
+  .text-aurora {
+    background: linear-gradient(92deg, #67e8f9 0%, #22d3ee 30%, #818cf8 65%, #c4b5fd 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Thin cyan top border used to "energize" key panels */
+  .hud-topline {
+    position: relative;
+  }
+  .hud-topline::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 12%;
+    right: 12%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.75), transparent);
+  }
+
+  /* Monospaced HUD data readout */
+  .hud-readout {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    letter-spacing: 0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* MASTER §6/§7: no motion for users who opt out. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

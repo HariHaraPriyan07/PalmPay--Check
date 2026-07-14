@@ -1,15 +1,16 @@
 # dependencies
-/node_modules
+node_modules
 
 # next.js
-/.next/
-/out/
+.next/
+out/
 next-env.d.ts
 
 # misc
 .DS_Store
 *.pem
 .vscode/
+chrome-profile/
 
 # env & secrets — never commit
 .env

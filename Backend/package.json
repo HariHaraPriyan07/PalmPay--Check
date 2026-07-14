@@ -1,0 +1,15 @@
+{
+  "name": "cit-palm-attendance-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Firebase project config (Firestore/Storage rules) and Firebase Admin SDK scripts for CIT Palm Attendance — seeding demo data and assigning role custom claims.",
+  "type": "module",
+  "scripts": {
+    "seed": "node scripts/seed.mjs",
+    "set-claims": "node scripts/set-claims.mjs",
+    "emulators": "firebase emulators:start --only auth,firestore"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0"
+  }
+}

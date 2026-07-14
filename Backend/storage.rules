@@ -1,0 +1,18 @@
+rules_version = '2';
+
+// Firebase Storage — OPTIONAL research-only enrollment images (§4, §11).
+// Raw palm images are NOT the matching credential (embeddings in Firestore are).
+// Images may be retained here only with recorded consent, and only the owning
+// section's advisor can touch them. Nobody else — not even coordinator/HOD.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /enrollmentImages/{sectionId}/{studentId}/{imageId} {
+      allow read, write: if request.auth != null
+        && request.auth.token.get('role', '') == 'advisor'
+        && request.auth.token.get('section', '') == sectionId;
+    }
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

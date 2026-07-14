@@ -1,0 +1,55 @@
+{
+  "input_name": "input",
+  "output_name": "embedding",
+  "input_size": 224,
+  "channel_order": "RGB",
+  "layout": "NCHW",
+  "scale": "divide_by_255",
+  "normalize_mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "normalize_std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "output_is_l2_normalized": true,
+  "similarity": "cosine (dot product of unit vectors)",
+  "verification_threshold_FAR_0.1pct": 0.534600019454956,
+  "models": {
+    "mobile": "palm_256_l2_fp32.onnx",
+    "web_primary_webgpu": "palm_fp16_web.onnx",
+    "web_fallback_wasm": "palm_256_l2_fp32.onnx",
+    "reference_fp32": "palm_256_l2_fp32.onnx"
+  },
+  "int8_viable": false,
+  "quantization_drift": {
+    "int8_mobile": {
+      "config": "preproc_per_channel_excl_57nodes",
+      "mean": 0.6993516457080841,
+      "min": 0.46947479248046875,
+      "passed": false
+    },
+    "int8_web": {
+      "config": "preproc_per_channel_excl_57nodes",
+      "mean": 0.6993516457080841,
+      "min": 0.46947479248046875,
+      "passed": false
+    },
+    "fp16_web": {
+      "mean": 0.9997148442268372,
+      "min": 0.9994140863418579,
+      "passed": true
+    }
+  },
+  "quantization_drift_bar": 0.99,
+  "notes": [
+    "CLAHE is a TRAIN-TIME augmentation only; do NOT apply it at inference.",
+    "Enroll = mean of L2-normalized embeddings from a few frames, then re-normalize.",
+    "Match if cosine(probe, template) >= verification_threshold.",
+    "int8_viable=false means INT8 quantization was tested and rejected for this model/backbone combination (MobileNetV3 SE-blocks are quantization-fragile). The 'models' block already routes to fp16/fp32 fallbacks \u2014 do not manually point auth traffic at palm_int8_mobile.onnx or palm_int8_web.onnx even though the files exist on disk; they are kept only for diagnostic reference.",
+    "Re-enrollment note: any templates built while int8 models were mistakenly in use should be regenerated against the fp16/fp32 path now marked authoritative."
+  ]
+}
