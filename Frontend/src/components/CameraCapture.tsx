@@ -7,12 +7,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, CheckCircle2, RefreshCcw, Video } from "lucide-react";
-import { getHandLandmarker, detectHands } from "@/lib/capture/handLandmarker";
+import type { Landmark } from "@mediapipe/tasks-vision";
+import { getHandLandmarker, detectHands, getHandedness } from "@/lib/capture/handLandmarker";
 import { extractPalmRoi } from "@/lib/capture/roi";
 import { assessQuality, grayFromCanvas, laplacianVariance } from "@/lib/capture/quality";
 import { assessLiveness, type LivenessResult } from "@/lib/capture/liveness";
+import { drawGuides, distanceStatus, type DistanceStatus } from "@/lib/capture/guides";
 import { preprocessRoi, type PreprocessedInput } from "@/lib/ml/preprocess";
+import { STEADY_HOLD_MS, STEADY_MOVE_THRESHOLD } from "@/lib/ml/config";
 import { Alert, Button, Select, Spinner } from "@/components/ui/primitives";
+import type { Handedness } from "@/lib/types";
 
 /** Mean luma below this on a persistently sampled frame reads as a black/dead feed. */
 const BLACK_FRAME_LUMA_THRESHOLD = 6;
@@ -38,11 +42,13 @@ export interface CaptureResult {
   /** Mean per-frame quality score (0..1) of accepted frames. */
   qualityScore: number;
   liveness: LivenessResult;
+  /** Majority hand across accepted frames (left/right enforcement, §5). */
+  handedness: Handedness | null;
 }
 
 type Stage = "starting" | "capturing" | "done" | "error";
 
-const MIN_FRAME_GAP_MS = 180; // spacing between accepted frames → natural micro-movement between them (§9)
+const MIN_FRAME_GAP_MS = 180; // default spacing between accepted frames → natural micro-movement between them (§9)
 
 /**
  * Open the webcam robustly. Some Windows machines abort ("Timeout starting
@@ -98,10 +104,23 @@ export function CameraCapture({
   targetFrames,
   onComplete,
   instruction,
+  frameGapMs = MIN_FRAME_GAP_MS,
+  requireSteady = false,
 }: {
   targetFrames: number;
   onComplete: (result: CaptureResult) => void;
   instruction: string;
+  /**
+   * Minimum spacing between accepted frames. Enrollment passes a wide gap so the
+   * capture is slow and deliberate instead of bursting near-duplicate frames.
+   */
+  frameGapMs?: number;
+  /**
+   * Require the palm to be held still (low frame-to-frame motion) for a short
+   * hold before each frame is accepted. Rejects shaky/mid-motion captures —
+   * used for enrollment, where a blurred frame permanently corrupts the template.
+   */
+  requireSteady?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -111,8 +130,24 @@ export function CameraCapture({
     grays: Float32Array[];
     lapVars: number[];
     qualities: number[];
+    world: Landmark[][];
+    hands: (Handedness | null)[];
     lastAcceptTs: number;
-  }>({ frames: [], grays: [], lapVars: [], qualities: [], lastAcceptTs: 0 });
+    /** Previous frame's ROI center/size — used to measure steadiness. */
+    prevRoi: { x: number; y: number; size: number } | null;
+    /** Timestamp the palm last moved beyond STEADY_MOVE_THRESHOLD. */
+    steadySinceTs: number;
+  }>({
+    frames: [],
+    grays: [],
+    lapVars: [],
+    qualities: [],
+    world: [],
+    hands: [],
+    lastAcceptTs: 0,
+    prevRoi: null,
+    steadySinceTs: 0,
+  });
 
   const [stage, setStage] = useState<Stage>("starting");
   const [error, setError] = useState<string | null>(null);
@@ -121,6 +156,13 @@ export function CameraCapture({
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null);
   const [blackFrameHint, setBlackFrameHint] = useState(false);
+  // Live positioning guidance overlay (Issue #2) — landmarks + framing + distance.
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const lastDistLabelRef = useRef("");
+  const [distance, setDistance] = useState<{ status: DistanceStatus; label: string }>({
+    status: "none",
+    label: "Show your palm",
+  });
 
   // Guards against React Strict Mode's double-invoked effects (mount → cleanup
   // → mount) racing two concurrent getUserMedia() calls against the same
@@ -148,7 +190,10 @@ export function CameraCapture({
     setError(null);
     setCount(0);
     setBlackFrameHint(false);
-    collectedRef.current = { frames: [], grays: [], lapVars: [], qualities: [], lastAcceptTs: 0 };
+    collectedRef.current = {
+      frames: [], grays: [], lapVars: [], qualities: [], world: [], hands: [],
+      lastAcceptTs: 0, prevRoi: null, steadySinceTs: 0,
+    };
     try {
       setHint("Requesting camera…");
       let stream: MediaStream | undefined;
@@ -233,33 +278,85 @@ export function CameraCapture({
         }
         const result = detectHands(landmarker, v, performance.now());
         const landmarks = result.landmarks?.[0];
+        const worldLandmarks = result.worldLandmarks?.[0];
+        const handedness = getHandedness(result);
         const roi = landmarks ? extractPalmRoi(v, landmarks) : null;
         const quality = assessQuality(roi);
 
+        // Live positioning overlay + distance readout (Issue #2). Purely visual —
+        // does not gate capture (the quality/steady gates below still decide).
+        const overlay = overlayRef.current;
+        if (overlay) {
+          const ow = v.clientWidth || v.videoWidth;
+          const oh = v.clientHeight || v.videoHeight;
+          if (overlay.width !== ow) overlay.width = ow;
+          if (overlay.height !== oh) overlay.height = oh;
+          drawGuides(overlay, {
+            landmarks: landmarks ?? null,
+            sizeFrac: roi?.sizeFrac ?? null,
+            mirrored: true,
+          });
+        }
+        const dist = distanceStatus(roi?.sizeFrac ?? null);
+        if (dist.label !== lastDistLabelRef.current) {
+          lastDistLabelRef.current = dist.label;
+          setDistance(dist);
+        }
+
         if (!quality.ok) {
           setHint(quality.message ?? instruction);
+          if (requireSteady) collectedRef.current.steadySinceTs = 0; // lost the palm → re-steady
         } else if (roi) {
           const now = performance.now();
           const col = collectedRef.current;
-          // Enforce temporal spacing so consecutive accepted frames capture
-          // natural micro-movement (anti-spoof signal, §9).
-          if (now - col.lastAcceptTs >= MIN_FRAME_GAP_MS) {
+
+          // Steadiness gate (enrollment): only accept once the palm has been held
+          // still for STEADY_HOLD_MS. Motion (ROI center drift + size change)
+          // beyond the threshold restarts the hold timer, so a shaky palm never
+          // captures a frame — even if it momentarily passes the sharpness gate.
+          let steady = true;
+          if (requireSteady) {
+            const prev = col.prevRoi;
+            const moved =
+              !prev ||
+              Math.hypot(roi.centerX - prev.x, roi.centerY - prev.y) +
+                Math.abs(roi.sizeFrac - prev.size) >
+                STEADY_MOVE_THRESHOLD;
+            if (moved || col.steadySinceTs === 0) col.steadySinceTs = now;
+            steady = now - col.steadySinceTs >= STEADY_HOLD_MS;
+          }
+          col.prevRoi = { x: roi.centerX, y: roi.centerY, size: roi.sizeFrac };
+
+          if (requireSteady && !steady) {
+            setHint(`Hold your palm still — steadying… (${col.frames.length} / ${targetFrames})`);
+          } else if (now - col.lastAcceptTs >= frameGapMs) {
             col.lastAcceptTs = now;
             const gray64 = grayFromCanvas(roi.canvas);
             col.frames.push(preprocessRoi(roi.canvas));
             col.grays.push(gray64);
             col.lapVars.push(laplacianVariance(gray64));
             col.qualities.push(quality.score);
+            if (worldLandmarks) col.world.push(worldLandmarks);
+            col.hands.push(handedness);
             setCount(col.frames.length);
             setHint(`Captured ${col.frames.length} / ${targetFrames} — hold your palm steady`);
 
             if (col.frames.length >= targetFrames) {
-              const liveness = assessLiveness(col.grays, col.lapVars);
+              const liveness = assessLiveness(col.grays, col.lapVars, col.world);
               const qualityScore =
                 col.qualities.reduce((a, b) => a + b, 0) / col.qualities.length;
+              // Majority hand across accepted frames (ignore null votes).
+              let left = 0;
+              let right = 0;
+              for (const h of col.hands) {
+                if (h === "Left") left++;
+                else if (h === "Right") right++;
+              }
+              const handedness: Handedness | null =
+                left === 0 && right === 0 ? null : left >= right ? "Left" : "Right";
               setStage("done");
               stopStream();
-              onComplete({ frames: col.frames, qualityScore, liveness });
+              onComplete({ frames: col.frames, qualityScore, liveness, handedness });
               return;
             }
           }
@@ -345,6 +442,24 @@ export function CameraCapture({
           muted
           className="aspect-video w-full -scale-x-100 object-cover"
         />
+        {/* Live positioning guides: hand landmarks + optimal framing box (Issue #2) */}
+        <canvas
+          ref={overlayRef}
+          className="pointer-events-none absolute inset-0 h-full w-full"
+          aria-hidden
+        />
+        {stage === "capturing" && (
+          <div
+            className={
+              "hud-readout absolute left-1/2 top-3 -translate-x-1/2 rounded-full px-3 py-1 text-xs font-medium tracking-wide ring-1 " +
+              (distance.status === "good"
+                ? "bg-status-present-bg/90 text-status-present-fg ring-status-present-fg/40"
+                : "bg-status-warn-bg/90 text-status-warn-fg ring-status-warn-fg/40")
+            }
+          >
+            Distance: {distance.label}
+          </div>
+        )}
         {stage === "capturing" && (
           <div className="pointer-events-none absolute inset-0" aria-hidden>
             {/* Sweeping scan line */}

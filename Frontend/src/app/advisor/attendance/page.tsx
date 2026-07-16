@@ -6,7 +6,7 @@
 // Absent / OD / Others (reason required) from the dropdown.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ScanLine, Save, Search } from "lucide-react";
+import { ListChecks, ScanLine, Save, Search } from "lucide-react";
 import { RequireRole, useAuth } from "@/lib/firebase/auth-context";
 import { AppShell } from "@/components/AppShell";
 import {
@@ -20,7 +20,7 @@ import {
   Spinner,
   type BadgeTone,
 } from "@/components/ui/primitives";
-import { VerifyModal } from "@/components/attendance/VerifyModal";
+import { IdentifyScan } from "@/components/attendance/IdentifyScan";
 import { listStudents } from "@/lib/db/students";
 import { getSectionRecordsForDate, markAttendance } from "@/lib/db/attendance";
 import { isWorkingDay } from "@/lib/db/calendar";
@@ -51,7 +51,7 @@ function AttendanceInner() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
-  const [verifyTarget, setVerifyTarget] = useState<StudentDoc | null>(null);
+  const [mode, setMode] = useState<"scan" | "roster">("scan");
   const [drafts, setDrafts] = useState<Map<string, { status: AttendanceStatus | ""; reason: string }>>(
     new Map(),
   );
@@ -202,6 +202,43 @@ function AttendanceInner() {
         </div>
       )}
 
+      {/* Mode toggle: continuous 1:N palm scan (default) vs roster / manual marking. */}
+      <div className="mb-4 inline-flex rounded-full bg-muted p-1">
+        <button
+          onClick={() => setMode("scan")}
+          className={
+            "flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all " +
+            (mode === "scan" ? "bg-primary/15 text-primary shadow-glow-cyan ring-1 ring-primary/40" : "text-body hover:text-primary")
+          }
+        >
+          <ScanLine className="h-4 w-4" aria-hidden /> Palm scan (auto)
+        </button>
+        <button
+          onClick={() => setMode("roster")}
+          className={
+            "flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all " +
+            (mode === "roster" ? "bg-primary/15 text-primary shadow-glow-cyan ring-1 ring-primary/40" : "text-body hover:text-primary")
+          }
+        >
+          <ListChecks className="h-4 w-4" aria-hidden /> Roster / manual
+        </button>
+      </div>
+
+      {mode === "scan" && (
+        workingDay === false ? (
+          <Alert tone="warn">Scanning is disabled on a non-working day.</Alert>
+        ) : user && section ? (
+          <IdentifyScan
+            sectionId={section}
+            advisorUid={user.uid}
+            students={students}
+            records={records}
+            onMarked={onMarked}
+          />
+        ) : null
+      )}
+
+      {mode === "roster" && (
       <Card dense>
         <div className="mb-3 flex items-center gap-2">
           <Search className="h-4 w-4 shrink-0 text-muted-fg" aria-hidden />
@@ -220,7 +257,6 @@ function AttendanceInner() {
                 <th className="px-3 py-2 font-medium">Roll no</th>
                 <th className="px-3 py-2 font-medium">Name</th>
                 <th className="px-3 py-2 font-medium">Status</th>
-                <th className="px-3 py-2 font-medium">Palm verify</th>
                 <th className="px-3 py-2 font-medium">Manual status</th>
               </tr>
             </thead>
@@ -257,22 +293,6 @@ function AttendanceInner() {
                       ) : (
                         <Badge tone="others">Unmarked</Badge>
                       )}
-                    </td>
-                    <td className="px-3 py-2">
-                      <Button
-                        variant="secondary"
-                        className="px-3 py-1.5 text-xs"
-                        disabled={disabled || s.enrollmentStatus !== "enrolled"}
-                        title={
-                          s.enrollmentStatus !== "enrolled"
-                            ? "Student has no palm template — enroll first"
-                            : undefined
-                        }
-                        onClick={() => setVerifyTarget(s)}
-                      >
-                        <ScanLine className="h-3.5 w-3.5" aria-hidden />
-                        {rec?.status === "present" ? "Re-verify" : "Verify"}
-                      </Button>
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex flex-wrap items-center gap-2">
@@ -334,7 +354,7 @@ function AttendanceInner() {
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-3 py-8 text-center text-muted-fg">
+                  <td colSpan={4} className="px-3 py-8 text-center text-muted-fg">
                     No students match the filter.
                   </td>
                 </tr>
@@ -343,15 +363,6 @@ function AttendanceInner() {
           </table>
         </div>
       </Card>
-
-      {verifyTarget && user && (
-        <VerifyModal
-          student={verifyTarget}
-          advisorUid={user.uid}
-          open={verifyTarget !== null}
-          onClose={() => setVerifyTarget(null)}
-          onMarked={onMarked}
-        />
       )}
     </>
   );

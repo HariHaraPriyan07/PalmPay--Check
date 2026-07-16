@@ -44,15 +44,22 @@ declare global {
   }
 }
 
-let ortScriptPromise: Promise<typeof OrtNs> | null = null;
+// Keyed by script URL — NOT a single shared promise. ort.webgpu.min.js and
+// ort.min.js each define their own top-level `ort` module instance with
+// independent internal WASM-init state. If a WebGPU session attempt fails,
+// ONNX Runtime Web permanently marks that module's wasm backend as failed
+// ("previous call to 'initWasm()' failed") — retrying within the SAME module
+// instance is impossible. The WASM fallback therefore needs its own fresh
+// module (a real load of ort.min.js), not the already-loaded webgpu bundle.
+const ortScriptPromises = new Map<string, Promise<typeof OrtNs>>();
 
 function loadOrt(script: string): Promise<typeof OrtNs> {
   if (typeof window === "undefined") {
     return Promise.reject(new Error("OnnxEmbeddingProvider is browser-only"));
   }
-  if (!ortScriptPromise) {
-    ortScriptPromise = new Promise<typeof OrtNs>((resolve, reject) => {
-      if (window.ort) return resolve(window.ort);
+  let promise = ortScriptPromises.get(script);
+  if (!promise) {
+    promise = new Promise<typeof OrtNs>((resolve, reject) => {
       const s = document.createElement("script");
       s.src = script;
       s.async = true;
@@ -74,11 +81,12 @@ function loadOrt(script: string): Promise<typeof OrtNs> {
         );
       document.head.appendChild(s);
     }).catch((err) => {
-      ortScriptPromise = null; // allow retry after transient failure
+      ortScriptPromises.delete(script); // allow retry after transient failure
       throw err;
     });
+    ortScriptPromises.set(script, promise);
   }
-  return ortScriptPromise;
+  return promise;
 }
 
 // ── float16 <-> float32 (the fp16 model's I/O dtype, §2) ─────────────────────
@@ -179,7 +187,7 @@ async function createSession(
   return session;
 }
 
-async function runSession(
+async function runSessionUnsafe(
   ort: typeof OrtNs,
   session: OrtNs.InferenceSession,
   variant: ModelVariant,
@@ -199,6 +207,26 @@ async function runSession(
   }
   // Already L2-normalized in-graph (§2) — returned as-is, NOT re-normalized.
   return emb;
+}
+
+// ONNX Runtime Web's WASM backend allows only ONE session.run() in flight at
+// a time — it's a single-flight guard baked into the wasm module itself
+// (shared across every session created from that module, including the
+// parity self-test's reference session), not something scoped per JS
+// session object. Enrollment/verification embed several captured frames via
+// Promise.all, so every run() must be funneled through this queue instead of
+// called directly, or ORT throws "Session already started".
+let runQueue: Promise<unknown> = Promise.resolve();
+
+function runSession(
+  ort: typeof OrtNs,
+  session: OrtNs.InferenceSession,
+  variant: ModelVariant,
+  input: PreprocessedInput,
+): Promise<Float32Array> {
+  const run = runQueue.catch(() => {}).then(() => runSessionUnsafe(ort, session, variant, input));
+  runQueue = run.catch(() => {});
+  return run;
 }
 
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
@@ -224,15 +252,18 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
 
     const wantWebgpu =
       ENABLE_WEBGPU && typeof navigator !== "undefined" && "gpu" in navigator;
-    const script = wantWebgpu ? ORT_WEBGPU_SCRIPT : ORT_WASM_SCRIPT;
-    const ort = await loadOrt(script);
+    let ort: typeof OrtNs;
 
     if (wantWebgpu) {
+      ort = await loadOrt(ORT_WEBGPU_SCRIPT);
       try {
         this.session = await createSession(ort, MODEL_VARIANTS.web_webgpu);
         this.variantKey = "web_webgpu";
       } catch (err) {
-        // The webgpu bundle also ships the wasm EP, so the safe default still works.
+        // The webgpu bundle's wasm backend permanently marks itself failed after
+        // one bad initWasm() — reusing `ort` here would just throw "previous
+        // call to 'initWasm()' failed" instead of actually retrying. Load a
+        // fresh ort.min.js module (its own independent wasm-init state) below.
         console.warn(
           "[ML] WebGPU session failed — falling back to FP32 on WASM (the safe default).",
           err,
@@ -240,6 +271,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
       }
     }
     if (!this.session) {
+      ort = await loadOrt(ORT_WASM_SCRIPT);
       try {
         this.session = await createSession(ort, MODEL_VARIANTS.web_wasm);
         this.variantKey = "web_wasm";
@@ -250,7 +282,7 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
         );
       }
     }
-    this.ort = ort;
+    this.ort = ort!;
 
     // Warm-up inference so the first real scan doesn't pay kernel-compile cost.
     const zeros: PreprocessedInput = {

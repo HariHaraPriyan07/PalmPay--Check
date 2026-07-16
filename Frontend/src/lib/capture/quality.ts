@@ -4,12 +4,16 @@
 import type { RoiInfo } from "./roi";
 
 // ── Gate thresholds (tunable) ────────────────────────────────────────────────
-export const MIN_PALM_SIZE_FRAC = 0.18; // palm must fill enough of the frame
-export const CENTER_TOLERANCE = 0.28; // palm center within ±28% of frame center
-export const MIN_OPENNESS = 1.05; // fingertip spread / palm size; fist ≈ < 0.8
-export const MIN_BRIGHTNESS = 60; // mean luma 0..255
-export const MAX_BRIGHTNESS = 205;
-export const MIN_LAPLACIAN_VARIANCE = 55; // motion blur / focus gate
+export const MIN_PALM_SIZE_FRAC = 0.15; // palm must fill enough of the frame
+export const CENTER_TOLERANCE = 0.32; // palm center within ±32% of frame center
+// Openness = mean fingertip distance from palm center / wrist→middleMCP distance.
+// For a flat open palm at typical webcam distance this is ~0.9–1.1; a fist is
+// ~0.5–0.7. The old value (1.05) was calibrated too tight and rejected most real
+// open palms with "Open your hand". 0.8 still reliably filters a closed fist.
+export const MIN_OPENNESS = 0.8;
+export const MIN_BRIGHTNESS = 55;  // mean luma 0..255
+export const MAX_BRIGHTNESS = 215;
+export const MIN_LAPLACIAN_VARIANCE = 40; // motion blur / focus gate
 
 export interface QualityChecks {
   detected: boolean;

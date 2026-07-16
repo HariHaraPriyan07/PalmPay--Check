@@ -15,24 +15,33 @@ import { getStudentEmbedding } from "@/lib/db/embeddings";
 import { markAttendance } from "@/lib/db/attendance";
 import { logVerificationEvent } from "@/lib/db/events";
 import { getEmbeddingProvider } from "@/lib/ml/embeddingProvider";
-import { averageEmbeddings, cosineSimilarity } from "@/lib/ml/cosine";
-import {
-  MODEL_FAMILY,
-  MODEL_VERSION,
-  RETRY_THRESHOLD,
-  VERIFICATION_THRESHOLD,
-  VERIFY_FRAME_COUNT,
-} from "@/lib/ml/config";
+import { averageEmbeddings } from "@/lib/ml/cosine";
+import { getScoringContext, scorePair } from "@/lib/ml/centering";
+import { MODEL_FAMILY, MODEL_VERSION, VERIFY_FRAME_COUNT } from "@/lib/ml/config";
 import { todayStr } from "@/lib/config/app";
-import type { AttendanceRecordDoc, EmbeddingDoc, StudentDoc, VerifyOutcome } from "@/lib/types";
+import type {
+  AttendanceRecordDoc,
+  EmbeddingDoc,
+  Handedness,
+  StudentDoc,
+  VerifyOutcome,
+} from "@/lib/types";
 
 type Step = "loading" | "no-embedding" | "capture" | "processing" | "result";
 
 interface VerifyState {
   outcome: VerifyOutcome;
   similarity: number;
+  acceptThreshold: number;
+  retryThreshold: number;
+  centered: boolean;
+  source: string;
+  sampleCount: number;
   livenessPassed: boolean;
   livenessNotes: string[];
+  handMismatch: boolean;
+  enrolledHand: Handedness | null;
+  shownHand: Handedness | null;
 }
 
 export function VerifyModal({
@@ -89,19 +98,35 @@ export function VerifyModal({
           capture.frames.map((f) => provider.getEmbedding(f)),
         );
         const live = averageEmbeddings(embeddings);
-        const similarity = cosineSimilarity(live, template.embedding);
 
-        // Decision (§4): accept ≥ 0.5346 (calibrated at FAR 0.1%), retry band
-        // just below, reject under that. A failed liveness check can never
-        // auto-accept — it demotes accept → retry (best-effort anti-spoof, §10).
+        // Score in the mean-centered space with the section's impostor-relative
+        // thresholds (ml/centering.ts) — raw cosine on this model is not
+        // separable, so both probe and template are centered against the
+        // section mean before comparison.
+        const ctx = await getScoringContext(student.sectionId);
+        const similarity = scorePair(live, template.embedding, ctx);
+        const { acceptThreshold, retryThreshold } = ctx;
+
+        // Decision (§4): accept ≥ acceptThreshold, retry band just below, reject
+        // under that. A failed liveness check can never auto-accept — it demotes
+        // accept → retry (best-effort anti-spoof, §10).
         let outcome: VerifyOutcome;
-        if (similarity >= VERIFICATION_THRESHOLD && capture.liveness.passed) outcome = "accept";
+        if (similarity >= acceptThreshold && capture.liveness.passed) outcome = "accept";
         else if (
-          similarity >= RETRY_THRESHOLD ||
-          (similarity >= VERIFICATION_THRESHOLD && !capture.liveness.passed)
+          similarity >= retryThreshold ||
+          (similarity >= acceptThreshold && !capture.liveness.passed)
         )
           outcome = "retry";
         else outcome = "reject";
+
+        // Wrong hand (left vs right) can never verify, whatever the score — the
+        // template stores which hand was enrolled and the two are mirror images
+        // (§5). Labels are self-consistent between enroll and verify, so a
+        // genuine same-hand attempt matches; a mismatch means the other hand.
+        const enrolledHand = template.handedness ?? null;
+        const shownHand = capture.handedness;
+        const handMismatch = !!enrolledHand && !!shownHand && enrolledHand !== shownHand;
+        if (handMismatch) outcome = "reject";
 
         const date = todayStr();
         await logVerificationEvent({
@@ -134,8 +159,16 @@ export function VerifyModal({
         setResult({
           outcome,
           similarity,
+          acceptThreshold,
+          retryThreshold,
+          centered: ctx.centered,
+          source: ctx.source,
+          sampleCount: ctx.sampleCount,
           livenessPassed: capture.liveness.passed,
           livenessNotes: capture.liveness.notes,
+          handMismatch,
+          enrolledHand,
+          shownHand,
         });
         setStep("result");
       } catch (err) {
@@ -202,6 +235,14 @@ export function VerifyModal({
             <Alert tone="error">{error}</Alert>
           ) : result ? (
             <>
+              {result.source === "raw-fallback" && (
+                <Alert tone="warn">
+                  Scoring on the UNRELIABLE raw-cosine fallback — no saved calibration and too few
+                  enrolled templates. Palms will not separate reliably. Open{" "}
+                  <span className="font-heading">Calibrate</span> and save a calibration (or enrol
+                  more students) for accurate matching.
+                </Alert>
+              )}
               {/* 3D verdict: particles assemble into ✓ / retry ring / ✕ */}
               <div
                 className={
@@ -227,7 +268,7 @@ export function VerifyModal({
                         : "text-status-absent-fg")
                   }
                 >
-                  SIM {result.similarity.toFixed(4)} / THR {VERIFICATION_THRESHOLD}
+                  SIM {result.similarity.toFixed(4)} / THR {result.acceptThreshold.toFixed(4)}
                 </div>
               </div>
 
@@ -237,7 +278,11 @@ export function VerifyModal({
                   <div>
                     <p className="font-semibold">Verified — marked present</p>
                     <p className="mt-1 text-sm">
-                      Similarity {result.similarity.toFixed(4)} (accept ≥ {VERIFICATION_THRESHOLD}, calibrated at FAR 0.1%)
+                      Similarity {result.similarity.toFixed(4)} (accept ≥ {result.acceptThreshold.toFixed(4)}
+                      {result.centered
+                        ? `, centered on ${result.sampleCount} section templates`
+                        : ", raw fallback — enrol more students to calibrate"}
+                      )
                     </p>
                   </div>
                 </div>
@@ -248,8 +293,8 @@ export function VerifyModal({
                   <div>
                     <p className="font-semibold">Uncertain — please retry</p>
                     <p className="mt-1 text-sm">
-                      Similarity {result.similarity.toFixed(4)} (accept ≥ {VERIFICATION_THRESHOLD}, retry ≥{" "}
-                      {RETRY_THRESHOLD.toFixed(4)}). Reposition the palm — better light, closer, fingers open —
+                      Similarity {result.similarity.toFixed(4)} (accept ≥ {result.acceptThreshold.toFixed(4)}, retry ≥{" "}
+                      {result.retryThreshold.toFixed(4)}). Reposition the palm — better light, closer, fingers open —
                       and try again. No mark has been made.
                     </p>
                     {!result.livenessPassed && (
@@ -267,12 +312,20 @@ export function VerifyModal({
                   <XCircle className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
                   <div>
                     <p className="font-semibold">Not verified</p>
-                    <p className="mt-1 text-sm">
-                      Similarity {result.similarity.toFixed(4)} is below the retry band (≥{" "}
-                      {RETRY_THRESHOLD.toFixed(4)}). The student was NOT marked present. If they are genuinely
-                      present, use the manual status dropdown (Others + reason) and re-enroll their
-                      palm later.
-                    </p>
+                    {result.handMismatch ? (
+                      <p className="mt-1 flex items-center gap-1.5 text-sm">
+                        <ShieldAlert className="h-4 w-4 shrink-0" aria-hidden />
+                        Wrong hand — this student enrolled their {result.enrolledHand} palm but the{" "}
+                        {result.shownHand} palm was shown. Use the enrolled hand and try again.
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-sm">
+                        Similarity {result.similarity.toFixed(4)} is below the retry band (≥{" "}
+                        {result.retryThreshold.toFixed(4)}). The student was NOT marked present. If they are genuinely
+                        present, use the manual status dropdown (Others + reason) and re-enroll their
+                        palm later.
+                      </p>
+                    )}
                   </div>
                 </div>
               )}

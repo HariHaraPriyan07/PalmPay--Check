@@ -4,7 +4,7 @@
 // ~10 quality-gated frames, each embedded; the averaged re-normalized vector
 // is stored as the template. Only the embedding is stored — never raw images.
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { CheckCircle2, ShieldCheck } from "lucide-react";
 import { Modal } from "@/components/ui/Modal";
 import { Alert, Button, Spinner } from "@/components/ui/primitives";
@@ -14,11 +14,12 @@ import { setEnrollmentStatus, setStudentConsent } from "@/lib/db/students";
 import { saveStudentEmbedding } from "@/lib/db/embeddings";
 import { getEmbeddingProvider } from "@/lib/ml/embeddingProvider";
 import { averageEmbeddings } from "@/lib/ml/cosine";
-import { ENROLL_FRAME_COUNT } from "@/lib/ml/config";
+import { invalidateScoringContext } from "@/lib/ml/centering";
+import { ENROLL_FRAME_COUNT, ENROLL_FRAME_GAP_MS, ENROLL_ROUNDS } from "@/lib/ml/config";
 import { todayStr } from "@/lib/config/app";
-import type { EnrollmentStatus, StudentDoc } from "@/lib/types";
+import type { EmbeddingDoc, EnrollmentStatus, Handedness, StudentDoc } from "@/lib/types";
 
-type Step = "consent" | "capture" | "saving" | "done" | "failed";
+type Step = "consent" | "capture" | "reposition" | "saving" | "done" | "failed";
 
 export function EnrollModal({
   student,
@@ -35,11 +36,26 @@ export function EnrollModal({
   const [consentChecked, setConsentChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [livenessWarn, setLivenessWarn] = useState<string[]>([]);
+  // The template is averaged over SEVERAL separate capture rounds — one session
+  // alone doesn't cancel session-to-session noise (measured: 1 round ≈ 11% EER,
+  // 4 rounds ≈ 0%). Accumulate every round's embeddings, then average at the end.
+  const [round, setRound] = useState(1);
+  const [captureKey, setCaptureKey] = useState(0); // bump to remount CameraCapture
+  const accRef = useRef<{ embs: Float32Array[]; qualities: number[]; hands: (Handedness | null)[] }>(
+    { embs: [], qualities: [], hands: [] },
+  );
+
+  function resetRounds() {
+    accRef.current = { embs: [], qualities: [], hands: [] };
+    setRound(1);
+    setCaptureKey((k) => k + 1);
+  }
 
   async function acceptConsent() {
     try {
       await setStudentConsent(student.studentId, true); // consentGiven + consentTimestamp (§5.1)
       onStatusChange(student.studentId, student.enrollmentStatus, true);
+      resetRounds();
       setStep("capture");
     } catch (err) {
       setError(`Could not record consent: ${err instanceof Error ? err.message : String(err)}`);
@@ -48,33 +64,60 @@ export function EnrollModal({
 
   const handleCapture = useCallback(
     async (capture: CaptureResult) => {
-      setStep("saving");
       setError(null);
+      // Each round must pass liveness — a failed round is re-taken, NOT stored,
+      // and does not consume the round count.
+      if (!capture.liveness.passed) {
+        setLivenessWarn(capture.liveness.notes);
+        setError(
+          "This round was rejected by the liveness/quality screen. Use the student's real palm with natural hand movement — not a photo or screen — and re-capture this round.",
+        );
+        setCaptureKey((k) => k + 1);
+        setStep("capture");
+        return;
+      }
+      setStep("saving");
       try {
-        // Enrollment quality must be strict from day one (§5): a capture that
-        // fails the liveness screen is rejected outright, not stored.
-        if (!capture.liveness.passed) {
-          setLivenessWarn(capture.liveness.notes);
-          setError(
-            "Capture rejected by the liveness/quality screen. Use the student's real palm with natural hand movement — not a photo or screen — and retry.",
-          );
-          setStep("failed");
-          await setEnrollmentStatus(student.studentId, "failed");
-          onStatusChange(student.studentId, "failed");
-          return;
-        }
         const provider = await getEmbeddingProvider();
         const embeddings = await Promise.all(capture.frames.map((f) => provider.getEmbedding(f)));
-        const template = averageEmbeddings(embeddings); // averaged + re-normalized (§5.2)
-        await saveStudentEmbedding({
+        const acc = accRef.current;
+        acc.embs.push(...embeddings);
+        acc.qualities.push(capture.qualityScore);
+        acc.hands.push(capture.handedness);
+
+        // More rounds to go → prompt a reposition so the next capture is independent.
+        if (round < ENROLL_ROUNDS) {
+          setRound(round + 1);
+          setStep("reposition");
+          return;
+        }
+
+        // Final round → average ALL rounds' embeddings into the template.
+        const template = averageEmbeddings(acc.embs); // averaged + re-normalized (§5.2)
+        let left = 0;
+        let right = 0;
+        for (const h of acc.hands) {
+          if (h === "Left") left++;
+          else if (h === "Right") right++;
+        }
+        const handedness: Handedness | null =
+          left === 0 && right === 0 ? null : left >= right ? "Left" : "Right";
+        const meanQuality =
+          acc.qualities.reduce((a, b) => a + b, 0) / Math.max(1, acc.qualities.length);
+        const doc: EmbeddingDoc = {
           studentId: student.studentId,
           sectionId: student.sectionId,
           embedding: Array.from(template),
           modelVersion: provider.modelVersion,
           enrollmentDate: todayStr(),
           deviceInfo: typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
-          qualityScore: Math.round(capture.qualityScore * 100) / 100,
-        });
+          qualityScore: Math.round(meanQuality * 100) / 100,
+        };
+        // Firestore rejects undefined fields — only set handedness when detected.
+        if (handedness) doc.handedness = handedness;
+        await saveStudentEmbedding(doc);
+        // A new template shifts the section mean → drop the cached centering context.
+        invalidateScoringContext(student.sectionId);
         await setEnrollmentStatus(student.studentId, "enrolled");
         onStatusChange(student.studentId, "enrolled");
         setStep("done");
@@ -89,7 +132,7 @@ export function EnrollModal({
         }
       }
     },
-    [onStatusChange, student],
+    [onStatusChange, round, student],
   );
 
   return (
@@ -142,16 +185,61 @@ export function EnrollModal({
 
       {step === "capture" && (
         <div className="space-y-3">
-          <p className="text-sm text-body">
-            Capturing <strong>{ENROLL_FRAME_COUNT} high-quality frames</strong>. Each frame must
-            pass the quality gates (palm detected, centered, open, well-lit, sharp, large enough) —
-            follow the on-screen hints.
-          </p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-body">
+              <strong>
+                Round {round} of {ENROLL_ROUNDS}
+              </strong>{" "}
+              · {ENROLL_FRAME_COUNT} frames. Multiple rounds (each repositioned) are averaged into
+              the template — this is what makes daily matching reliable.
+            </p>
+            <div className="hud-readout shrink-0 rounded bg-muted px-2 py-1 text-xs tracking-widest text-primary">
+              {round}/{ENROLL_ROUNDS}
+            </div>
+          </div>
+          {error && <Alert tone="warn">{error}</Alert>}
           <CameraCapture
+            key={captureKey}
             targetFrames={ENROLL_FRAME_COUNT}
             instruction="Hold the palm flat toward the camera, fingers relaxed and open"
+            // Enrollment is slow and deliberate: wide frame spacing + require the
+            // palm to be held still before each frame, so no shaky/blurred crop
+            // ever corrupts the stored template.
+            frameGapMs={ENROLL_FRAME_GAP_MS}
+            requireSteady
             onComplete={(c) => void handleCapture(c)}
           />
+        </div>
+      )}
+
+      {step === "reposition" && (
+        <div className="space-y-4 py-6">
+          <div className="flex items-start gap-3 rounded-card bg-muted p-4">
+            <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-status-present-fg" aria-hidden />
+            <div className="text-sm text-body">
+              <p className="font-semibold text-foreground">
+                Round {round - 1} of {ENROLL_ROUNDS} captured
+              </p>
+              <p className="mt-1">
+                <strong>Take your hand fully out of frame and reposition it</strong> — slightly
+                different angle/distance/lighting. Independent rounds are what make the template
+                robust. {ENROLL_ROUNDS - (round - 1)} round(s) to go.
+              </p>
+            </div>
+          </div>
+          <div className="flex justify-end gap-3">
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                setCaptureKey((k) => k + 1);
+                setStep("capture");
+              }}
+            >
+              Capture round {round}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -207,7 +295,14 @@ export function EnrollModal({
             <Button variant="secondary" onClick={onClose}>
               Close
             </Button>
-            <Button onClick={() => setStep("capture")}>Retry capture</Button>
+            <Button
+              onClick={() => {
+                resetRounds();
+                setStep("capture");
+              }}
+            >
+              Restart capture
+            </Button>
           </div>
         </div>
       )}

@@ -9,7 +9,13 @@
 // inference silently corrupts embeddings. No gamma, no histogram equalization,
 // no illumination/edge/skeleton ops of any kind.
 
-import { CHANNEL_ORDER, INPUT_SIZE, NORMALIZE_MEAN, NORMALIZE_STD } from "./config";
+import {
+  CHANNEL_ORDER,
+  INPUT_SIZE,
+  NORMALIZE_MEAN,
+  NORMALIZE_STD,
+  ROI_ILLUMINATION_NORM,
+} from "./config";
 
 export interface PreprocessedInput {
   /** CHW float32 tensor, size 3*S*S: x = (px/255 − mean) / std, planes in CHANNEL_ORDER. */
@@ -41,14 +47,44 @@ export function preprocessRoi(roi: HTMLCanvasElement | OffscreenCanvas): Preproc
   // Channel plane order per CHANNEL_ORDER (RGB → planes r,g,b; BGR → planes b,g,r).
   const planeOf: [number, number, number] = CHANNEL_ORDER === "RGB" ? [0, 1, 2] : [2, 1, 0];
 
+  // Gray copy is always the same (quality checks / dev placeholder use it).
   for (let i = 0; i < px; i++) {
-    const r = data[i * 4];
-    const g = data[i * 4 + 1];
-    const b = data[i * 4 + 2];
-    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
-    const rgb = [r / 255, g / 255, b / 255];
-    for (let c = 0; c < 3; c++) {
-      tensor[planeOf[c] * px + i] = (rgb[c] - NORMALIZE_MEAN[c]) / NORMALIZE_STD[c];
+    gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+  }
+
+  if (ROI_ILLUMINATION_NORM) {
+    // Per-ROI per-channel standardization: (px − channelMean) / channelStd.
+    // Removes this capture's brightness + contrast so lighting/exposure changes
+    // don't move the embedding (illumination invariance, §3.6b). No ÷255 /
+    // ImageNet step — the standardization subsumes it.
+    const mean = [0, 0, 0];
+    for (let i = 0; i < px; i++) {
+      mean[0] += data[i * 4];
+      mean[1] += data[i * 4 + 1];
+      mean[2] += data[i * 4 + 2];
+    }
+    mean[0] /= px;
+    mean[1] /= px;
+    mean[2] /= px;
+    const varc = [0, 0, 0];
+    for (let i = 0; i < px; i++) {
+      for (let c = 0; c < 3; c++) {
+        const d = data[i * 4 + c] - mean[c];
+        varc[c] += d * d;
+      }
+    }
+    const std = varc.map((v) => Math.sqrt(v / px) || 1);
+    for (let i = 0; i < px; i++) {
+      for (let c = 0; c < 3; c++) {
+        tensor[planeOf[c] * px + i] = (data[i * 4 + c] - mean[c]) / std[c];
+      }
+    }
+  } else {
+    // Fixed ÷255 + ImageNet mean/std (original training contract).
+    for (let i = 0; i < px; i++) {
+      for (let c = 0; c < 3; c++) {
+        tensor[planeOf[c] * px + i] = (data[i * 4 + c] / 255 - NORMALIZE_MEAN[c]) / NORMALIZE_STD[c];
+      }
     }
   }
   return { tensor, gray, width: S, height: S };

@@ -37,3 +37,44 @@ export function averageEmbeddings(embeddings: Float32Array[]): Float32Array {
   for (let i = 0; i < dim; i++) out[i] /= embeddings.length;
   return l2Normalize(out);
 }
+
+// ── Mean-centering (fixes the "matches all hands" collapse) ──────────────────
+// This palm model's raw 256-D outputs share a dominant common direction: even
+// completely unrelated images score cosine ~0.6–0.97 against each other, so the
+// genuine and impostor distributions OVERLAP and no raw-cosine threshold can
+// separate them. Subtracting the population-mean embedding (the shared
+// direction) and re-normalizing pulls impostors down toward ~0 while genuine
+// pairs stay high — restoring a usable margin. Templates are stored RAW; both
+// probe and template are centered symmetrically at match time, so the mean can
+// keep improving as more students enrol without invalidating stored templates.
+
+/** Element-wise mean of many vectors (NOT re-normalized — this is the centering origin). */
+export function meanVector(embeddings: ArrayLike<number>[]): Float32Array {
+  if (embeddings.length === 0) throw new Error("meanVector: empty input");
+  const dim = embeddings[0].length;
+  const out = new Float32Array(dim);
+  for (const e of embeddings) {
+    for (let i = 0; i < dim; i++) out[i] += e[i];
+  }
+  for (let i = 0; i < dim; i++) out[i] /= embeddings.length;
+  return out;
+}
+
+/** (v − mean) then L2-normalized. Returns a fresh vector; inputs untouched. */
+export function centerAndNormalize(v: ArrayLike<number>, mean: ArrayLike<number>): Float32Array {
+  if (v.length !== mean.length) {
+    throw new Error(`centerAndNormalize: dim mismatch ${v.length} vs ${mean.length}`);
+  }
+  const out = new Float32Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] - mean[i];
+  return l2Normalize(out);
+}
+
+/** Cosine similarity in the mean-centered space (subtract `mean`, renormalize, dot). */
+export function centeredCosine(
+  a: ArrayLike<number>,
+  b: ArrayLike<number>,
+  mean: ArrayLike<number>,
+): number {
+  return cosineSimilarity(centerAndNormalize(a, mean), centerAndNormalize(b, mean));
+}

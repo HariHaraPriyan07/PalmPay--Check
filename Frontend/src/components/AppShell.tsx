@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { CalendarDays, Hand, LayoutDashboard, LogOut, ScanLine, UserPlus } from "lucide-react";
+import { CalendarDays, FlaskConical, Hand, LayoutDashboard, LogOut, ScanLine, UserPlus } from "lucide-react";
 import clsx from "clsx";
 import { useEffect } from "react";
 import { useAuth } from "@/lib/firebase/auth-context";
@@ -14,6 +14,7 @@ const advisorNav = [
   { href: "/advisor", label: "Dashboard", icon: LayoutDashboard },
   { href: "/advisor/attendance", label: "Take attendance", icon: ScanLine },
   { href: "/advisor/enroll", label: "Enrollment", icon: UserPlus },
+  { href: "/advisor/calibrate", label: "Calibrate", icon: FlaskConical },
 ];
 const staffNav = [
   { href: "/overview", label: "Department overview", icon: LayoutDashboard },
